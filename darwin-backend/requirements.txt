@@ -1,0 +1,6 @@
+dotenv
+alembic
+poetry
+fastapi
+uvicorn
+asyncpg

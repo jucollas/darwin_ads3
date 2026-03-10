@@ -1,0 +1,180 @@
+# ============================================================
+# DEMO MVP - Darwin Ads (Backend) usando cURL (sin interfaz)
+# Flujo: health -> crear campaign -> listar -> generar variants (OpenAI)
+#        -> ver detail -> publicar -> refrescar métricas -> correr Darwin
+#        -> ver resultados + overview -> (opcional) scheduler
+#
+# Requisitos:
+# - Backend corriendo en http://127.0.0.1:8000
+# - jq instalado para formatear JSON (recomendado)
+# - Variables .env correctas (OpenAI + Meta Page Token)
+# ============================================================
+
+# -------------------------
+# 0) Set base URL
+# -------------------------
+export BASE_URL="http://127.0.0.1:8000"
+
+
+# -------------------------
+# 1) Healthcheck
+# -------------------------
+curl -s "$BASE_URL/health" | jq
+
+
+# -------------------------
+# 2) Crear Campaign (contexto fijo)
+#    - channel: facebook_page
+#    - country: CO
+#    - objective: engagement
+# -------------------------
+CAMPAIGN_ID=$(
+  curl -s -X POST "$BASE_URL/campaigns" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "Promo Hamburguesa Cali",
+      "channel": "facebook_page",
+      "country": "CO",
+      "product": { "name": "Hamburguesa Doble", "price_cop": 22000 },
+      "objective": "engagement",
+      "status": "active"
+    }' | jq -r '.id'
+)
+
+echo "CAMPAIGN_ID=$CAMPAIGN_ID"
+
+
+# -------------------------
+# 3) Listar campaigns
+# -------------------------
+curl -s "$BASE_URL/campaigns" | jq
+
+
+# -------------------------
+# 4) Generar 3 Variants (draft) usando lenguaje natural (OpenAI)
+#    Endpoint: POST /campaigns/{id}/variants/generate
+# -------------------------
+curl -s -X POST "$BASE_URL/campaigns/$CAMPAIGN_ID/variants/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_prompt": "Quiero promocionar mi hamburguesa doble en Cali con una promo 2x1 solo por hoy. Tono cercano, directo y con llamado a WhatsApp."
+  }' | jq
+
+
+# -------------------------
+# 5) Ver detalle de Campaign (trae variants + latest_metric)
+#    Endpoint: GET /campaigns/{id}
+# -------------------------
+curl -s "$BASE_URL/campaigns/$CAMPAIGN_ID" | jq
+
+
+# -------------------------
+# 6) Seleccionar una Variant para publicar (tomamos la primera)
+# -------------------------
+VARIANT_ID=$(
+  curl -s "$BASE_URL/campaigns/$CAMPAIGN_ID" | jq -r '.variants[0].id'
+)
+echo "VARIANT_ID=$VARIANT_ID"
+
+
+# -------------------------
+# 7) Publicar Variant en Facebook Page
+#    Endpoint: POST /variants/{id}/publish
+# -------------------------
+curl -s -X POST "$BASE_URL/variants/$VARIANT_ID/publish" | jq
+
+
+# -------------------------
+# 8) Mostrar la URL del post (si Meta la devuelve)
+# -------------------------
+curl -s "$BASE_URL/campaigns/$CAMPAIGN_ID" | jq -r '.variants[] | select(.id=="'"$VARIANT_ID"'") | .external.post_url'
+
+
+# -------------------------
+# 9) Refrescar métricas del post (crea snapshot en variant_metrics)
+#    Endpoint: POST /variants/{id}/metrics/refresh
+# -------------------------
+curl -s -X POST "$BASE_URL/variants/$VARIANT_ID/metrics/refresh" | jq
+
+# Repite para mostrar que cada refresh crea una fila nueva (id distinto):
+curl -s -X POST "$BASE_URL/variants/$VARIANT_ID/metrics/refresh" | jq
+
+
+# -------------------------
+# 10) Ejecutar Darwin (duplicate/kill/skip) sobre published variants
+#     Endpoint: POST /darwin/run
+#     Regla:
+#       - fitness >= threshold_up => duplicate (hija draft)
+#       - fitness <= threshold_down => kill (y delete post remoto si aplica)
+# -------------------------
+curl -s -X POST "$BASE_URL/darwin/run" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "threshold_up": 5,
+    "threshold_down": -3,
+    "dry_run": false,
+    "delete_remote_post": true
+  }' | jq
+
+
+# -------------------------
+# 11) Ver campaign detail para confirmar:
+#     - Variants hijas (draft) si duplicó
+#     - Variants killed si eliminó
+# -------------------------
+curl -s "$BASE_URL/campaigns/$CAMPAIGN_ID" | jq
+
+
+# -------------------------
+# 12) Overview general (lo que espera el frontend)
+#     Endpoint: GET /metrics/overview
+# -------------------------
+curl -s "$BASE_URL/metrics/overview" | jq
+
+
+# ============================================================
+# OPCIONALES (solo si tu backend los tiene habilitados)
+# ============================================================
+
+# -------------------------
+# A) Unpublish manual (borrar post remoto y volver variant a draft)
+#    Endpoint: POST /variants/{id}/unpublish
+# -------------------------
+# curl -s -X POST "$BASE_URL/variants/$VARIANT_ID/unpublish" \
+#   -H "Content-Type: application/json" \
+#   -d '{"delete_remote_post": true}' | jq
+
+
+# -------------------------
+# B) Scheduler control desde API (si lo implementaste)
+#    - Ver config: GET /scheduler/config
+#    - Update config: PUT /scheduler/config
+#    - Run inmediato: POST /scheduler/run-now
+# -------------------------
+
+# Ver configuración del scheduler:
+# curl -s "$BASE_URL/scheduler/config" | jq
+
+# Activar scheduler y correr cada 60s:
+# curl -s -X PUT "$BASE_URL/scheduler/config" \
+#   -H "Content-Type: application/json" \
+#   -d '{"enabled": true, "interval_seconds": 60}' | jq
+
+# Desactivar scheduler:
+# curl -s -X PUT "$BASE_URL/scheduler/config" \
+#   -H "Content-Type: application/json" \
+#   -d '{"enabled": false}' | jq
+
+# Run inmediato del ciclo completo (refresh metrics + darwin):
+# curl -s -X POST "$BASE_URL/scheduler/run-now" \
+#   -H "Content-Type: application/json" \
+#   -d '{"threshold_up":5,"threshold_down":-3,"dry_run":false,"delete_remote_post":true}' | jq
+
+
+# ============================================================
+# Notas para demo (importante):
+# - Con métricas reales orgánicas, puede que fitness no llegue a +5 o -3.
+# - Para garantizar duplicate/kill en vivo:
+#   1) Dale likes/comments/shares manualmente al post en Facebook y refresca métricas.
+#   2) O implementa un endpoint /variants/{id}/metrics/mock (si lo deseas).
+# ============================================================
